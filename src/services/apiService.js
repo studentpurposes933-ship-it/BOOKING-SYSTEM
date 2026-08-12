@@ -27,10 +27,10 @@ const createApiClient = async () => {
 };
 
 export const apiService = {
-  // Send AI Chat message
-  async sendAIChat(message, history = []) {
+  // Send AI Chat message with persistent booking draft
+  async sendAIChat(message, history = [], currentDraft = {}) {
     const client = await createApiClient();
-    const response = await client.post('/ai/chat', { message, history });
+    const response = await client.post('/ai/chat', { message, history, currentDraft });
     return response.data;
   },
 

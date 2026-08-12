@@ -1,10 +1,10 @@
-import React, { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { apiService } from '../../services/apiService.js';
 import { createClientAppointmentAtomic } from '../../services/clientBookingService.js';
 import { useAuth } from '../../context/AuthContext.jsx';
-import { Bot, Send, User, Calendar, Clock, CheckCircle2, X } from 'lucide-react';
+import { Bot, Send, User, Calendar, CheckCircle2, X } from 'lucide-react';
 
-// Format 24h string ("14:00") or ISO date to 12-hour AM/PM ("2:00 PM")
+// Format 24h string ("10:00" or "14:00") to 12-hour AM/PM ("10:00 AM" or "2:00 PM")
 const format12h = (timeStr) => {
   if (!timeStr) return '';
   if (typeof timeStr !== 'string') return '';
@@ -23,7 +23,7 @@ const format12h = (timeStr) => {
   return `${h}:${m.padStart(2, '0')} ${ampm}`;
 };
 
-// Format YYYY-MM-DD or ISO string to human date ("Tomorrow", "Thursday, Aug 13")
+// Format YYYY-MM-DD or ISO string to human date ("today", "tomorrow", "Friday, Aug 14")
 const formatHumanDate = (dateStr) => {
   if (!dateStr) return '';
   const now = new Date();
@@ -34,14 +34,23 @@ const formatHumanDate = (dateStr) => {
   const tomStr = tom.toISOString().split('T')[0];
 
   const target = dateStr.split('T')[0];
-  if (target === todayStr) return 'Today';
-  if (target === tomStr) return 'Tomorrow';
+  if (target === todayStr) return 'today';
+  if (target === tomStr) return 'tomorrow';
 
   const d = new Date(target + 'T00:00:00');
   if (isNaN(d.getTime())) return dateStr;
 
   return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
 };
+
+// Static outside component — stable reference, no useEffect dep needed
+const PLACEHOLDER_EXAMPLES = [
+  "e.g. Book tomorrow at 10 AM for a meeting",
+  "e.g. Friday at 2 PM for a consultation",
+  "e.g. Today at 9 AM for an interview",
+  "e.g. Monday at 4 PM for a project review",
+  "e.g. Book Aug 15 at 11 AM",
+];
 
 export const AIChat = ({ onBookingSuccess }) => {
   const { userProfile, currentUser } = useAuth();
@@ -63,6 +72,24 @@ export const AIChat = ({ onBookingSuccess }) => {
   const [alternatives, setAlternatives] = useState([]);
   const [missingFields, setMissingFields] = useState([]);
   const [confirmedBooking, setConfirmedBooking] = useState(null);
+
+  // Persistent Booking Draft State across turns
+  const [bookingDraft, setBookingDraft] = useState({
+    date: null,
+    startTime: null,
+    duration: 30,
+    purpose: null,
+  });
+
+  // Rotating placeholder examples
+  const [placeholderIdx, setPlaceholderIdx] = useState(0);
+
+  useEffect(() => {
+    const t = setInterval(() => {
+      setPlaceholderIdx((i) => (i + 1) % PLACEHOLDER_EXAMPLES.length);
+    }, 3500);
+    return () => clearInterval(t);
+  }, []); // PLACEHOLDER_EXAMPLES is a stable module-level constant
 
   const messagesEndRef = useRef(null);
 
@@ -94,7 +121,23 @@ export const AIChat = ({ onBookingSuccess }) => {
 
     try {
       const chatHistory = messages.map((m) => `${m.sender === 'user' ? 'User' : 'AI'}: ${m.text}`);
-      const response = await apiService.sendAIChat(textToSend, chatHistory);
+
+      // Pass persistent bookingDraft with every AI chat request
+      const response = await apiService.sendAIChat(textToSend, chatHistory, bookingDraft);
+
+      // Update persistent draft with newly merged extracted parameters
+      // But ONLY keep date+startTime from extracted if it's NOT a conflict response
+      // (conflict means old time, not the new slot user wants)
+      if (response.extracted) {
+        setBookingDraft((prev) => ({
+          ...prev,
+          ...response.extracted,
+          // On conflict: clear startTime so next request re-parses the chosen alternative's time
+          startTime: (response.status === 'conflict' || response.status === 'outside_working_hours')
+            ? null
+            : (response.extracted.startTime || prev.startTime),
+        }));
+      }
 
       const aiMsgObj = {
         id: `ai-${Date.now()}`,
@@ -167,6 +210,10 @@ export const AIChat = ({ onBookingSuccess }) => {
 
       setPendingConfirmation(null);
       setMissingFields([]);
+      setAlternatives([]);
+      // Reset draft for next booking
+      setBookingDraft({ date: null, startTime: null, duration: 30, purpose: null });
+
       if (onBookingSuccess) onBookingSuccess();
     } catch (err) {
       console.error('Booking Error:', err);
@@ -186,11 +233,59 @@ export const AIChat = ({ onBookingSuccess }) => {
     }
   };
 
+  // Reset everything and start fresh for a new booking
+  const handleBookAnother = () => {
+    const now = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true });
+    setConfirmedBooking(null);
+    setMissingFields([]);
+    setAlternatives([]);
+    setPendingConfirmation(null);
+    setBookingDraft({ date: null, startTime: null, duration: 30, purpose: null });
+    // Start a totally fresh conversation
+    setMessages([
+      {
+        id: `fresh-${Date.now()}`,
+        sender: 'ai',
+        text: `Sure! Let's book another one. When would you like to meet?`,
+        timestamp: now,
+      },
+    ]);
+  };
+
+  // Done — show thank you, then return to idle
+  const handleDone = () => {
+    const now = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true });
+    setConfirmedBooking(null);
+    setMissingFields([]);
+    setAlternatives([]);
+    setBookingDraft({ date: null, startTime: null, duration: 30, purpose: null });
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `thankyou-${Date.now()}`,
+        sender: 'ai',
+        text: `You’re all set! 🎉 See you soon. If you ever need to book again, just ask!`,
+        timestamp: now,
+        isSuccess: true,
+      },
+    ]);
+  };
+
   const handleChipClick = (chipText) => {
     handleSendMessage(chipText);
   };
 
-  // Determine dynamic suggestion chips based on missing info or confirmation state
+  // When user clicks an alternative slot chip, clear date+time so it re-parses from the chip text
+  const handleAlternativeChipClick = (alt) => {
+    setBookingDraft((prev) => ({
+      ...prev,
+      date: null,
+      startTime: null,
+    }));
+    handleSendMessage(`Book on ${alt.formattedDate} at ${alt.formattedTime}`);
+  };
+
+  // Render suggestion chips for ALL missing fields simultaneously
   const renderSuggestionChips = () => {
     if (pendingConfirmation) {
       return (
@@ -201,7 +296,14 @@ export const AIChat = ({ onBookingSuccess }) => {
           <button className="chip-btn secondary-chip" onClick={() => handleSendMessage('Change time')} disabled={loading}>
             Change Time
           </button>
-          <button className="chip-btn danger-chip" onClick={() => setPendingConfirmation(null)} disabled={loading}>
+          <button
+            className="chip-btn danger-chip"
+            onClick={() => {
+              setPendingConfirmation(null);
+              setBookingDraft({ date: null, startTime: null, duration: 30, purpose: null });
+            }}
+            disabled={loading}
+          >
             <X size={14} /> Cancel
           </button>
         </div>
@@ -215,7 +317,7 @@ export const AIChat = ({ onBookingSuccess }) => {
             <button
               key={idx}
               className="chip-btn alt-chip"
-              onClick={() => handleSendMessage(`Book on ${alt.formattedDate} at ${alt.formattedTime}`)}
+              onClick={() => handleAlternativeChipClick(alt)}
               disabled={loading}
             >
               {alt.formattedTime} ({alt.formattedDate})
@@ -225,50 +327,81 @@ export const AIChat = ({ onBookingSuccess }) => {
       );
     }
 
-    if (missingFields.includes('date')) {
-      return (
-        <div className="chip-group">
-          <button className="chip-btn" onClick={() => handleChipClick('Today')} disabled={loading}>Today</button>
-          <button className="chip-btn" onClick={() => handleChipClick('Tomorrow')} disabled={loading}>Tomorrow</button>
-          <button className="chip-btn" onClick={() => handleChipClick('Next Monday')} disabled={loading}>Monday</button>
-          <button className="chip-btn" onClick={() => handleChipClick('This Friday')} disabled={loading}>Friday</button>
+    // Determine missing fields from both server response AND local bookingDraft
+    const draftMissing = [];
+    if (!bookingDraft.date) draftMissing.push('date');
+    if (!bookingDraft.startTime) draftMissing.push('startTime');
+    if (!bookingDraft.purpose) draftMissing.push('purpose');
+    const activeMissing = missingFields.length > 0 ? missingFields : draftMissing;
+
+    const sections = [];
+
+    if (activeMissing.includes('date')) {
+      sections.push(
+        <div key="date-section" className="chip-section">
+          <span className="chip-section-label">📅 When?</span>
+          <div className="chip-row">
+            <button className="chip-btn" onClick={() => handleChipClick('Today')} disabled={loading}>Today</button>
+            <button className="chip-btn" onClick={() => handleChipClick('Tomorrow')} disabled={loading}>Tomorrow</button>
+            <button className="chip-btn" onClick={() => handleChipClick('Friday')} disabled={loading}>Friday</button>
+            <button className="chip-btn" onClick={() => handleChipClick('Monday')} disabled={loading}>Monday</button>
+          </div>
         </div>
       );
     }
 
-    if (missingFields.includes('startTime')) {
-      return (
-        <div className="chip-group">
-          <button className="chip-btn" onClick={() => handleChipClick('10:00 AM')} disabled={loading}>10:00 AM</button>
-          <button className="chip-btn" onClick={() => handleChipClick('2:00 PM')} disabled={loading}>2:00 PM</button>
-          <button className="chip-btn" onClick={() => handleChipClick('4:00 PM')} disabled={loading}>4:00 PM</button>
+    if (activeMissing.includes('startTime')) {
+      sections.push(
+        <div key="time-section" className="chip-section">
+          <span className="chip-section-label">🕐 What time?</span>
+          <div className="chip-row">
+            <button className="chip-btn" onClick={() => handleChipClick('9:00 AM')} disabled={loading}>9:00 AM</button>
+            <button className="chip-btn" onClick={() => handleChipClick('10:00 AM')} disabled={loading}>10:00 AM</button>
+            <button className="chip-btn" onClick={() => handleChipClick('12:00 PM')} disabled={loading}>12:00 PM</button>
+            <button className="chip-btn" onClick={() => handleChipClick('2:00 PM')} disabled={loading}>2:00 PM</button>
+            <button className="chip-btn" onClick={() => handleChipClick('4:00 PM')} disabled={loading}>4:00 PM</button>
+          </div>
         </div>
       );
     }
 
-    if (missingFields.includes('purpose')) {
-      return (
-        <div className="chip-group">
-          <button className="chip-btn" onClick={() => handleChipClick('Meeting')} disabled={loading}>Meeting</button>
-          <button className="chip-btn" onClick={() => handleChipClick('Consultation')} disabled={loading}>Consultation</button>
-          <button className="chip-btn" onClick={() => handleChipClick('Project Review')} disabled={loading}>Project Review</button>
-          <button className="chip-btn" onClick={() => handleChipClick('Interview')} disabled={loading}>Interview</button>
+    if (activeMissing.includes('purpose')) {
+      sections.push(
+        <div key="purpose-section" className="chip-section">
+          <span className="chip-section-label">📌 What for?</span>
+          <div className="chip-row">
+            <button className="chip-btn" onClick={() => handleChipClick('Meeting with HR')} disabled={loading}>Meeting with HR</button>
+            <button className="chip-btn" onClick={() => handleChipClick('Consultation')} disabled={loading}>Consultation</button>
+            <button className="chip-btn" onClick={() => handleChipClick('Project Review')} disabled={loading}>Project Review</button>
+            <button className="chip-btn" onClick={() => handleChipClick('Interview')} disabled={loading}>Interview</button>
+            <button className="chip-btn" onClick={() => handleChipClick('Team Sync')} disabled={loading}>Team Sync</button>
+            <button className="chip-btn" onClick={() => handleChipClick('Design Audit')} disabled={loading}>Design Audit</button>
+          </div>
         </div>
       );
     }
 
-    // Default quick starter chips
+    if (sections.length > 0) {
+      return <div className="chip-sections-container">{sections}</div>;
+    }
+
+    // Default quick-book example buttons (shown when no fields missing and no conflict)
     return (
-      <div className="chip-group">
-        <button className="chip-btn" onClick={() => handleChipClick('Book tomorrow at 3 PM for project meeting')} disabled={loading}>
-          "Book tomorrow at 3 PM"
-        </button>
-        <button className="chip-btn" onClick={() => handleChipClick('Book next Monday morning for consultation')} disabled={loading}>
-          "Monday morning"
-        </button>
-        <button className="chip-btn" onClick={() => handleChipClick('Can I book Friday at 4:30 PM?')} disabled={loading}>
-          "Friday at 4:30 PM"
-        </button>
+      <div className="chip-sections-container">
+        <div className="chip-section">
+          <span className="chip-section-label">⚡ Quick book</span>
+          <div className="chip-row">
+            <button className="chip-btn quick-book-chip" onClick={() => handleChipClick('Today at 10 AM for a meeting')} disabled={loading}>
+              Today · 10 AM · Meeting
+            </button>
+            <button className="chip-btn quick-book-chip" onClick={() => handleChipClick('Tomorrow at 2 PM for a consultation')} disabled={loading}>
+              Tomorrow · 2 PM · Consultation
+            </button>
+            <button className="chip-btn quick-book-chip" onClick={() => handleChipClick('Friday at 4 PM for a project review')} disabled={loading}>
+              Friday · 4 PM · Project Review
+            </button>
+          </div>
+        </div>
       </div>
     );
   };
@@ -286,7 +419,7 @@ export const AIChat = ({ onBookingSuccess }) => {
         </span>
       </div>
 
-      {/* Messages Scroll Area */}
+      {/* Messages */}
       <div className="ai-chat-messages">
         {messages.map((msg) => (
           <div key={msg.id} className={`chat-message ${msg.sender}-message ${msg.isError ? 'error-msg' : ''} ${msg.isSuccess ? 'success-msg' : ''}`}>
@@ -313,7 +446,7 @@ export const AIChat = ({ onBookingSuccess }) => {
           </div>
         )}
 
-        {/* Compact Confirmation Summary Card */}
+        {/* Compact Confirmation Card */}
         {pendingConfirmation && !loading && (
           <div className="confirmation-card-compact">
             <div className="card-compact-header">
@@ -344,7 +477,7 @@ export const AIChat = ({ onBookingSuccess }) => {
             </div>
             <div className="card-compact-actions">
               <button className="btn-confirm" onClick={handleConfirmBooking} disabled={loading}>
-                <CheckCircle2 size={15} /> Confirm
+                <CheckCircle2 size={15} /> Confirm Booking
               </button>
               <button className="btn-cancel" onClick={() => setPendingConfirmation(null)} disabled={loading}>
                 Change
@@ -353,7 +486,7 @@ export const AIChat = ({ onBookingSuccess }) => {
           </div>
         )}
 
-        {/* Success Confirmation Card */}
+        {/* Success Booking Card */}
         {confirmedBooking && !loading && (
           <div className="success-booking-card">
             <div className="success-header">
@@ -364,13 +497,23 @@ export const AIChat = ({ onBookingSuccess }) => {
               <strong>"{confirmedBooking.purpose}"</strong>
               <p>{confirmedBooking.humanDate} • {confirmedBooking.startTime12h}</p>
             </div>
+            <div className="success-actions">
+              <button className="btn-book-another" onClick={handleBookAnother}>
+                🗓️ Book Another
+              </button>
+              <button className="btn-done" onClick={handleDone}>
+                ✓ Done
+              </button>
+            </div>
           </div>
         )}
+
+        {/* Book Another prompt is embedded in the success card above */}
 
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Dynamic Suggestion Chips */}
+      {/* Suggestion Chips Bar */}
       <div className="suggestion-chips-bar">
         {renderSuggestionChips()}
       </div>
@@ -379,7 +522,7 @@ export const AIChat = ({ onBookingSuccess }) => {
       <div className="ai-chat-input-bar">
         <input
           type="text"
-          placeholder="Type your request (e.g. 'Book tomorrow at 4 PM')..."
+          placeholder={PLACEHOLDER_EXAMPLES[placeholderIdx]}
           value={inputMessage}
           onChange={(e) => setInputMessage(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}

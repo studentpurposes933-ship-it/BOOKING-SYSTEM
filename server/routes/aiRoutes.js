@@ -7,21 +7,21 @@ const router = express.Router();
 
 router.post('/chat', verifyToken, async (req, res) => {
   try {
-    const { message, history = [] } = req.body;
+    const { message, history = [], currentDraft = {} } = req.body;
 
     if (!message || typeof message !== 'string') {
       return res.status(400).json({ error: 'Message string is required.' });
     }
 
-    // 1. Natural language parameter extraction via AI Service
+    // 1. Natural language parameter extraction via AI Service with persistent draft merging
     const aiResult = await extractBookingIntent({
       userMessage: message,
       history,
       userProfile: req.user,
-      currentContext: { currentDate: new Date().toISOString().split('T')[0] },
+      currentDraft,
     });
 
-    // 2. If information is missing, prompt user with short message & missing fields
+    // 2. If information is missing, prompt user with short message, missing fields, and current draft state
     if (aiResult.missingFields && aiResult.missingFields.length > 0) {
       return res.json({
         status: 'need_info',
@@ -74,7 +74,7 @@ router.post('/chat', verifyToken, async (req, res) => {
     // 6. Slot is available -> Present compact confirmation summary card to user
     return res.json({
       status: 'confirm_booking',
-      message: `${startTime12h} ${humanDate} is available. Ready to book?`,
+      message: `${startTime12h} ${humanDate} · ${aiResult.purpose}. Book for ${duration} minutes?`,
       extracted: {
         ...aiResult,
         startTimeISO,
