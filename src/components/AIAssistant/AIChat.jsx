@@ -2,42 +2,58 @@ import React, { useState, useRef, useEffect } from 'react';
 import { apiService } from '../../services/apiService.js';
 import { createClientAppointmentAtomic } from '../../services/clientBookingService.js';
 import { useAuth } from '../../context/AuthContext.jsx';
-import { Bot, Send, User, Sparkles, CheckCircle2, Clock, RefreshCw } from 'lucide-react';
+import { Bot, Send, User, Calendar, Clock, CheckCircle2, X } from 'lucide-react';
 
-// Pool of dynamic prompts that automatically rotate
-const DYNAMIC_PROMPT_POOLS = [
-  [
-    'Book tomorrow at 3:00 PM for a project meeting.',
-    'I need a meeting next Monday morning.',
-    'Can I book Friday at 4:30 PM for consultation?',
-  ],
-  [
-    'Schedule tomorrow morning at 10:00 AM for code review.',
-    'Book next Tuesday at 2:30 PM for strategy sync.',
-    'Can I get an appointment Friday afternoon at 3:00 PM?',
-  ],
-  [
-    'I need a 1 hour consultation next Wednesday at 11 AM.',
-    'Schedule tomorrow at 4:00 PM for design audit.',
-    'Book an appointment next Thursday at 2:00 PM.',
-  ],
-];
+// Format 24h string ("14:00") or ISO date to 12-hour AM/PM ("2:00 PM")
+const format12h = (timeStr) => {
+  if (!timeStr) return '';
+  if (typeof timeStr !== 'string') return '';
+  if (timeStr.includes('AM') || timeStr.includes('PM')) return timeStr;
 
-const PLACEHOLDER_LIST = [
-  "Type your request (e.g. 'Book tomorrow at 3 PM')...",
-  "Type your request (e.g. 'Schedule Friday afternoon for consultation')...",
-  "Type your request (e.g. 'I need a 1 hour meeting next Monday')...",
-  "Type your request (e.g. 'Book tomorrow morning at 10 AM')...",
-];
+  const parts = timeStr.split('T');
+  const target = parts.length > 1 ? parts[1] : timeStr;
+  const [hStr, mStr] = target.split(':');
+  let h = parseInt(hStr, 10);
+  const m = mStr ? mStr.substring(0, 2) : '00';
+  if (isNaN(h)) return timeStr;
+
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  h = h % 12;
+  if (h === 0) h = 12;
+  return `${h}:${m.padStart(2, '0')} ${ampm}`;
+};
+
+// Format YYYY-MM-DD or ISO string to human date ("Tomorrow", "Thursday, Aug 13")
+const formatHumanDate = (dateStr) => {
+  if (!dateStr) return '';
+  const now = new Date();
+  const todayStr = now.toISOString().split('T')[0];
+
+  const tom = new Date(now);
+  tom.setDate(tom.getDate() + 1);
+  const tomStr = tom.toISOString().split('T')[0];
+
+  const target = dateStr.split('T')[0];
+  if (target === todayStr) return 'Today';
+  if (target === tomStr) return 'Tomorrow';
+
+  const d = new Date(target + 'T00:00:00');
+  if (isNaN(d.getTime())) return dateStr;
+
+  return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+};
 
 export const AIChat = ({ onBookingSuccess }) => {
   const { userProfile, currentUser } = useAuth();
+  const userName = userProfile?.name || currentUser?.displayName || 'there';
+  const userEmail = userProfile?.email || currentUser?.email || '';
+
   const [messages, setMessages] = useState([
     {
       id: 'init-1',
       sender: 'ai',
-      text: `Hi ${userProfile?.name || currentUser?.displayName || 'there'}! I'm your AI Booking Assistant. How can I help you schedule an appointment today?`,
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      text: `Hi ${userName}! How can I help you schedule an appointment today?`,
+      timestamp: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true }),
     },
   ]);
 
@@ -45,14 +61,8 @@ export const AIChat = ({ onBookingSuccess }) => {
   const [loading, setLoading] = useState(false);
   const [pendingConfirmation, setPendingConfirmation] = useState(null);
   const [alternatives, setAlternatives] = useState([]);
-
-  // Dynamic Prompt & Placeholder State
-  const [promptPoolIndex, setPromptPoolIndex] = useState(0);
-  const [placeholderIndex, setPlaceholderIndex] = useState(0);
-
-  // Real-Time Sync Indicator State
-  const [lastUpdated, setLastUpdated] = useState(new Date().toLocaleTimeString());
-  const [secondsToNextUpdate, setSecondsToNextUpdate] = useState(5);
+  const [missingFields, setMissingFields] = useState([]);
+  const [confirmedBooking, setConfirmedBooking] = useState(null);
 
   const messagesEndRef = useRef(null);
 
@@ -62,34 +72,7 @@ export const AIChat = ({ onBookingSuccess }) => {
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages, pendingConfirmation, alternatives]);
-
-  // Rotate prompt pills & placeholder every 8 seconds
-  useEffect(() => {
-    const promptInterval = setInterval(() => {
-      setPromptPoolIndex((prev) => (prev + 1) % DYNAMIC_PROMPT_POOLS.length);
-      setPlaceholderIndex((prev) => (prev + 1) % PLACEHOLDER_LIST.length);
-    }, 8000);
-
-    return () => clearInterval(promptInterval);
-  }, []);
-
-  // Ticking 5-second countdown timer for next sync status
-  useEffect(() => {
-    const timer = setInterval(() => {
-      setSecondsToNextUpdate((prev) => {
-        if (prev <= 1) {
-          setLastUpdated(new Date().toLocaleTimeString());
-          return 5;
-        }
-        return prev - 1;
-      });
-    }, 1000);
-
-    return () => clearInterval(timer);
-  }, []);
-
-  const activePrompts = DYNAMIC_PROMPT_POOLS[promptPoolIndex];
+  }, [messages, pendingConfirmation, alternatives, loading, confirmedBooking]);
 
   const handleSendMessage = async (customText = null) => {
     const textToSend = customText || inputMessage;
@@ -99,7 +82,7 @@ export const AIChat = ({ onBookingSuccess }) => {
       id: `usr-${Date.now()}`,
       sender: 'user',
       text: textToSend,
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      timestamp: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true }),
     };
 
     setMessages((prev) => [...prev, userMsgObj]);
@@ -107,9 +90,7 @@ export const AIChat = ({ onBookingSuccess }) => {
     setLoading(true);
     setAlternatives([]);
     setPendingConfirmation(null);
-
-    // Rotate prompts on send
-    setPromptPoolIndex((prev) => (prev + 1) % DYNAMIC_PROMPT_POOLS.length);
+    setConfirmedBooking(null);
 
     try {
       const chatHistory = messages.map((m) => `${m.sender === 'user' ? 'User' : 'AI'}: ${m.text}`);
@@ -119,10 +100,16 @@ export const AIChat = ({ onBookingSuccess }) => {
         id: `ai-${Date.now()}`,
         sender: 'ai',
         text: response.message,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        timestamp: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true }),
       };
 
       setMessages((prev) => [...prev, aiMsgObj]);
+
+      if (response.status === 'need_info') {
+        setMissingFields(response.missingFields || []);
+      } else {
+        setMissingFields([]);
+      }
 
       if (response.status === 'confirm_booking') {
         setPendingConfirmation(response.extracted);
@@ -136,14 +123,13 @@ export const AIChat = ({ onBookingSuccess }) => {
       const errorMsgObj = {
         id: `ai-err-${Date.now()}`,
         sender: 'ai',
-        text: err.response?.data?.message || 'Sorry, I encountered an issue checking your booking request. Please try again.',
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        text: err.response?.data?.message || 'Sorry, I ran into an error checking availability. Please try again.',
+        timestamp: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true }),
         isError: true,
       };
       setMessages((prev) => [...prev, errorMsgObj]);
     } finally {
       setLoading(false);
-      setLastUpdated(new Date().toLocaleTimeString());
     }
   };
 
@@ -153,70 +139,159 @@ export const AIChat = ({ onBookingSuccess }) => {
     setLoading(true);
     try {
       await createClientAppointmentAtomic({
-        name: pendingConfirmation.name || userProfile?.name || currentUser?.displayName || 'Valued User',
-        email: pendingConfirmation.email || userProfile?.email || currentUser?.email || '',
-        purpose: pendingConfirmation.purpose,
+        name: pendingConfirmation.name || userName,
+        email: pendingConfirmation.email || userEmail,
+        purpose: pendingConfirmation.purpose || 'Meeting',
         startTime: pendingConfirmation.startTimeISO,
         endTime: pendingConfirmation.endTimeISO,
       });
+
+      const confirmedData = {
+        purpose: pendingConfirmation.purpose || 'Meeting',
+        humanDate: formatHumanDate(pendingConfirmation.date),
+        startTime12h: format12h(pendingConfirmation.startTime),
+      };
+
+      setConfirmedBooking(confirmedData);
 
       setMessages((prev) => [
         ...prev,
         {
           id: `ai-success-${Date.now()}`,
           sender: 'ai',
-          text: `🎉 Success! Your appointment "${pendingConfirmation.purpose}" has been confirmed for ${pendingConfirmation.date} at ${pendingConfirmation.startTime}. Data saved to Firestore!`,
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          text: `Booked! 🎉 ${confirmedData.humanDate} at ${confirmedData.startTime12h}.`,
+          timestamp: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true }),
           isSuccess: true,
         },
       ]);
 
       setPendingConfirmation(null);
+      setMissingFields([]);
       if (onBookingSuccess) onBookingSuccess();
     } catch (err) {
-      console.error('Booking Confirmation Error:', err);
-      const errMsg = err.message || 'Failed to confirm booking.';
+      console.error('Booking Error:', err);
       setMessages((prev) => [
         ...prev,
         {
           id: `ai-fail-${Date.now()}`,
           sender: 'ai',
-          text: `❌ Booking Failed: ${errMsg}`,
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          text: `❌ ${err.message || 'Booking failed. Slot may be taken.'}`,
+          timestamp: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true }),
           isError: true,
         },
       ]);
       setPendingConfirmation(null);
     } finally {
       setLoading(false);
-      setLastUpdated(new Date().toLocaleTimeString());
     }
   };
 
-  const handleSelectAlternative = (altSlot) => {
-    const requestPrompt = `Let's book on ${altSlot.formattedDate} at ${altSlot.formattedTime}.`;
-    handleSendMessage(requestPrompt);
+  const handleChipClick = (chipText) => {
+    handleSendMessage(chipText);
+  };
+
+  // Determine dynamic suggestion chips based on missing info or confirmation state
+  const renderSuggestionChips = () => {
+    if (pendingConfirmation) {
+      return (
+        <div className="chip-group">
+          <button className="chip-btn primary-chip" onClick={handleConfirmBooking} disabled={loading}>
+            <CheckCircle2 size={14} /> ✓ Confirm Booking
+          </button>
+          <button className="chip-btn secondary-chip" onClick={() => handleSendMessage('Change time')} disabled={loading}>
+            Change Time
+          </button>
+          <button className="chip-btn danger-chip" onClick={() => setPendingConfirmation(null)} disabled={loading}>
+            <X size={14} /> Cancel
+          </button>
+        </div>
+      );
+    }
+
+    if (alternatives.length > 0) {
+      return (
+        <div className="chip-group">
+          {alternatives.map((alt, idx) => (
+            <button
+              key={idx}
+              className="chip-btn alt-chip"
+              onClick={() => handleSendMessage(`Book on ${alt.formattedDate} at ${alt.formattedTime}`)}
+              disabled={loading}
+            >
+              {alt.formattedTime} ({alt.formattedDate})
+            </button>
+          ))}
+        </div>
+      );
+    }
+
+    if (missingFields.includes('date')) {
+      return (
+        <div className="chip-group">
+          <button className="chip-btn" onClick={() => handleChipClick('Today')} disabled={loading}>Today</button>
+          <button className="chip-btn" onClick={() => handleChipClick('Tomorrow')} disabled={loading}>Tomorrow</button>
+          <button className="chip-btn" onClick={() => handleChipClick('Next Monday')} disabled={loading}>Monday</button>
+          <button className="chip-btn" onClick={() => handleChipClick('This Friday')} disabled={loading}>Friday</button>
+        </div>
+      );
+    }
+
+    if (missingFields.includes('startTime')) {
+      return (
+        <div className="chip-group">
+          <button className="chip-btn" onClick={() => handleChipClick('10:00 AM')} disabled={loading}>10:00 AM</button>
+          <button className="chip-btn" onClick={() => handleChipClick('2:00 PM')} disabled={loading}>2:00 PM</button>
+          <button className="chip-btn" onClick={() => handleChipClick('4:00 PM')} disabled={loading}>4:00 PM</button>
+        </div>
+      );
+    }
+
+    if (missingFields.includes('purpose')) {
+      return (
+        <div className="chip-group">
+          <button className="chip-btn" onClick={() => handleChipClick('Meeting')} disabled={loading}>Meeting</button>
+          <button className="chip-btn" onClick={() => handleChipClick('Consultation')} disabled={loading}>Consultation</button>
+          <button className="chip-btn" onClick={() => handleChipClick('Project Review')} disabled={loading}>Project Review</button>
+          <button className="chip-btn" onClick={() => handleChipClick('Interview')} disabled={loading}>Interview</button>
+        </div>
+      );
+    }
+
+    // Default quick starter chips
+    return (
+      <div className="chip-group">
+        <button className="chip-btn" onClick={() => handleChipClick('Book tomorrow at 3 PM for project meeting')} disabled={loading}>
+          "Book tomorrow at 3 PM"
+        </button>
+        <button className="chip-btn" onClick={() => handleChipClick('Book next Monday morning for consultation')} disabled={loading}>
+          "Monday morning"
+        </button>
+        <button className="chip-btn" onClick={() => handleChipClick('Can I book Friday at 4:30 PM?')} disabled={loading}>
+          "Friday at 4:30 PM"
+        </button>
+      </div>
+    );
   };
 
   return (
     <div className="ai-assistant-container">
+      {/* Header */}
       <div className="ai-assistant-header">
         <div className="ai-header-title">
           <Bot size={20} className="bot-icon" />
           <h3>AI Booking Assistant</h3>
         </div>
-        <div className="sync-status-indicator" title="Real-time Firestore listener active">
-          <span className="pulsing-dot"></span>
-          <span className="sync-text">Updated: {lastUpdated}</span>
-          <span className="next-sync-badge">Next sync: {secondsToNextUpdate}s</span>
-        </div>
+        <span className="online-badge">
+          <span className="pulsing-dot"></span> Fast AI
+        </span>
       </div>
 
+      {/* Messages Scroll Area */}
       <div className="ai-chat-messages">
         {messages.map((msg) => (
           <div key={msg.id} className={`chat-message ${msg.sender}-message ${msg.isError ? 'error-msg' : ''} ${msg.isSuccess ? 'success-msg' : ''}`}>
             <div className="message-avatar">
-              {msg.sender === 'user' ? <User size={16} /> : <Bot size={16} />}
+              {msg.sender === 'user' ? <User size={14} /> : <Bot size={14} />}
             </div>
             <div className="message-content">
               <div className="message-text">{msg.text}</div>
@@ -228,7 +303,7 @@ export const AIChat = ({ onBookingSuccess }) => {
         {loading && (
           <div className="chat-message ai-message loading-msg">
             <div className="message-avatar">
-              <Bot size={16} />
+              <Bot size={14} />
             </div>
             <div className="message-content">
               <div className="typing-dots">
@@ -238,59 +313,56 @@ export const AIChat = ({ onBookingSuccess }) => {
           </div>
         )}
 
-        {/* Alternative Time Slots suggestions */}
-        {alternatives.length > 0 && !loading && (
-          <div className="alternatives-card">
-            <div className="alt-title">
-              <Clock size={16} />
-              <span>Suggested Available Slots:</span>
+        {/* Compact Confirmation Summary Card */}
+        {pendingConfirmation && !loading && (
+          <div className="confirmation-card-compact">
+            <div className="card-compact-header">
+              <Calendar size={16} />
+              <h4>Appointment Details</h4>
             </div>
-            <div className="alt-pills">
-              {alternatives.map((alt, idx) => (
-                <button key={idx} className="alt-pill" onClick={() => handleSelectAlternative(alt)}>
-                  {alt.formattedDate} @ {alt.formattedTime}
-                </button>
-              ))}
+            <div className="card-compact-details">
+              <div className="detail-row">
+                <span className="detail-icon">📅</span>
+                <span className="detail-val">{formatHumanDate(pendingConfirmation.date)}</span>
+              </div>
+              <div className="detail-row">
+                <span className="detail-icon">🕐</span>
+                <span className="detail-val">{format12h(pendingConfirmation.startTime)} – {pendingConfirmation.endTime12h || format12h(pendingConfirmation.endTime)}</span>
+              </div>
+              <div className="detail-row">
+                <span className="detail-icon">📌</span>
+                <span className="detail-val">{pendingConfirmation.purpose || 'Meeting'}</span>
+              </div>
+              <div className="detail-row">
+                <span className="detail-icon">👤</span>
+                <span className="detail-val">{pendingConfirmation.name || userName}</span>
+              </div>
+              <div className="detail-row">
+                <span className="detail-icon">✉️</span>
+                <span className="detail-val">{pendingConfirmation.email || userEmail}</span>
+              </div>
+            </div>
+            <div className="card-compact-actions">
+              <button className="btn-confirm" onClick={handleConfirmBooking} disabled={loading}>
+                <CheckCircle2 size={15} /> Confirm
+              </button>
+              <button className="btn-cancel" onClick={() => setPendingConfirmation(null)} disabled={loading}>
+                Change
+              </button>
             </div>
           </div>
         )}
 
-        {/* Appointment Confirmation Summary Card */}
-        {pendingConfirmation && !loading && (
-          <div className="confirmation-card">
-            <div className="confirmation-header">
-              <Sparkles size={18} />
-              <h4>Appointment Summary</h4>
+        {/* Success Confirmation Card */}
+        {confirmedBooking && !loading && (
+          <div className="success-booking-card">
+            <div className="success-header">
+              <CheckCircle2 size={18} />
+              <h4>Booked! 🎉</h4>
             </div>
-            <div className="confirmation-body">
-              <div className="summary-row">
-                <span className="label">Name:</span>
-                <span className="value">{pendingConfirmation.name || userProfile?.name}</span>
-              </div>
-              <div className="summary-row">
-                <span className="label">Email:</span>
-                <span className="value">{pendingConfirmation.email || userProfile?.email}</span>
-              </div>
-              <div className="summary-row">
-                <span className="label">Date:</span>
-                <span className="value">{pendingConfirmation.date}</span>
-              </div>
-              <div className="summary-row">
-                <span className="label">Time:</span>
-                <span className="value">{pendingConfirmation.startTime} ({pendingConfirmation.duration || 30} mins)</span>
-              </div>
-              <div className="summary-row">
-                <span className="label">Purpose:</span>
-                <span className="value">{pendingConfirmation.purpose}</span>
-              </div>
-            </div>
-            <div className="confirmation-actions">
-              <button className="confirm-btn" onClick={handleConfirmBooking} disabled={loading}>
-                <CheckCircle2 size={16} /> Confirm Booking
-              </button>
-              <button className="cancel-btn" onClick={() => setPendingConfirmation(null)} disabled={loading}>
-                Cancel
-              </button>
+            <div className="success-body">
+              <strong>"{confirmedBooking.purpose}"</strong>
+              <p>{confirmedBooking.humanDate} • {confirmedBooking.startTime12h}</p>
             </div>
           </div>
         )}
@@ -298,27 +370,23 @@ export const AIChat = ({ onBookingSuccess }) => {
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Dynamic Rotating Quick Prompts */}
-      <div className="quick-prompts-bar">
-        {activePrompts.map((p, idx) => (
-          <button key={idx} className="prompt-pill dynamic-prompt" onClick={() => handleSendMessage(p)} disabled={loading}>
-            "{p}"
-          </button>
-        ))}
+      {/* Dynamic Suggestion Chips */}
+      <div className="suggestion-chips-bar">
+        {renderSuggestionChips()}
       </div>
 
-      {/* Input box with rotating placeholder */}
+      {/* Input Bar */}
       <div className="ai-chat-input-bar">
         <input
           type="text"
-          placeholder={PLACEHOLDER_LIST[placeholderIndex]}
+          placeholder="Type your request (e.g. 'Book tomorrow at 4 PM')..."
           value={inputMessage}
           onChange={(e) => setInputMessage(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
           disabled={loading}
         />
         <button onClick={() => handleSendMessage()} disabled={loading || !inputMessage.trim()}>
-          <Send size={16} />
+          <Send size={15} />
         </button>
       </div>
     </div>

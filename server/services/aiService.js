@@ -1,43 +1,81 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 
 /**
- * Parses user input using Gemini API to extract structured appointment intent and parameters.
+ * Converts 24-hour time string ("14:00") or raw ISO time to 12-hour AM/PM format ("2:00 PM")
+ */
+export function formatTime12h(timeStr) {
+  if (!timeStr) return '';
+  if (typeof timeStr !== 'string') return '';
+  if (timeStr.includes('AM') || timeStr.includes('PM')) return timeStr;
+  
+  const [hStr, mStr] = timeStr.split(':');
+  let h = parseInt(hStr, 10);
+  const m = mStr ? mStr.substring(0, 2) : '00';
+  
+  if (isNaN(h)) return timeStr;
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  h = h % 12;
+  if (h === 0) h = 12;
+  return `${h}:${m.padStart(2, '0')} ${ampm}`;
+}
+
+/**
+ * Converts ISO date string ("2026-08-13") to natural human date ("Tomorrow", "Thursday, Aug 13")
+ */
+export function formatHumanDate(dateStr) {
+  if (!dateStr) return '';
+  const now = new Date();
+  const todayStr = now.toISOString().split('T')[0];
+
+  const tom = new Date(now);
+  tom.setDate(tom.getDate() + 1);
+  const tomStr = tom.toISOString().split('T')[0];
+
+  if (dateStr === todayStr) return 'Today';
+  if (dateStr === tomStr) return 'Tomorrow';
+
+  const d = new Date(dateStr + 'T00:00:00');
+  if (isNaN(d.getTime())) return dateStr;
+
+  return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+}
+
+/**
+ * Parses user input using Gemini API or rule-based fallback to extract structured parameters.
  */
 export const extractBookingIntent = async ({ userMessage, history = [], userProfile = {}, currentContext = {} }) => {
   const apiKey = process.env.AI_API_KEY;
   const now = new Date();
   const currentDateStr = currentContext.currentDate || now.toISOString().split('T')[0];
-  const currentTimeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
 
   const systemInstruction = `
-You are an intelligent booking assistant parser. Your ONLY job is to analyze the user's natural language message and extract structured appointment parameters.
-You must NEVER determine availability or check if a time slot is booked.
+You are a fast, intelligent appointment booking assistant.
+Your goal is to parse user messages and generate SHORT, SMART conversational responses (1–2 short sentences MAX).
+
+RULES:
+1. ALWAYS use 12-HOUR TIME FORMAT with AM/PM (e.g., "10:00 AM", "2:30 PM"). NEVER show 24-hour times like "14:00" or "17:00".
+2. ALWAYS use human-friendly relative dates (e.g. "Tomorrow", "Friday, Aug 14"). NEVER show raw ISO dates like "2026-08-14" in conversational messages.
+3. Keep responses strictly 1-2 SHORT sentences. Never write long paragraphs.
+4. If missing details, ask for ONLY ONE missing item at a time.
+5. Use the user's name ("${userProfile.name || ''}") and email ("${userProfile.email || ''}") automatically. Do not ask for name or email if already provided.
 
 Current Reference Context:
 - Current Date: ${currentDateStr} (${now.toLocaleDateString('en-US', { weekday: 'long' })})
-- Current Time: ${currentTimeStr}
 - Default User Name: "${userProfile.name || ''}"
 - Default User Email: "${userProfile.email || ''}"
 
-Return ONLY a JSON object with this EXACT structure (no markdown wrapper, no extra text):
+Return ONLY a JSON object with this structure:
 {
   "intent": "book_appointment" | "ask_question" | "unknown",
   "date": "YYYY-MM-DD" or null,
-  "startTime": "HH:MM" (24-hour format) or null,
+  "startTime": "HH:MM" (24-hour format internally for backend) or null,
   "duration": number (in minutes, default 30) or null,
-  "purpose": "short summary of purpose" or null,
-  "name": "User Name" or null,
-  "email": "User Email" or null,
-  "missingFields": ["date", "startTime", "purpose", etc.] (array of fields needed for a complete booking),
-  "responseMessage": "A friendly conversational response asking for missing details or confirming extraction"
+  "purpose": "short summary" or null,
+  "name": "User Name" or "${userProfile.name || 'Valued User'}",
+  "email": "User Email" or "${userProfile.email || ''}",
+  "missingFields": ["date", "startTime", "purpose"],
+  "responseMessage": "SHORT 1-2 sentence AI message using AM/PM and natural dates"
 }
-
-Extraction Rules:
-1. Handle relative terms like "today", "tomorrow", "next Monday", "this Friday", "Aug 20" accurately relative to Current Date (${currentDateStr}).
-2. Handle natural time expressions like "3 PM" (15:00), "3:30 PM" (15:30), "11 AM" (11:00), "morning" (09:00), "afternoon" (14:00), "evening" (16:00).
-3. If duration is specified (e.g., "1 hour", "45 mins"), set duration in minutes. Default duration is 30 minutes.
-4. Purpose should be extracted from phrases like "for a project review", "consultation", "team sync".
-5. If details like time or purpose are missing, list them in missingFields and ask for them in responseMessage.
 `;
 
   if (apiKey) {
@@ -49,21 +87,19 @@ Extraction Rules:
       const result = await model.generateContent(prompt);
       const responseText = result.response.text().trim();
 
-      // Clean markdown codeblocks if present
       const cleanJson = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
       const parsed = JSON.parse(cleanJson);
       return parsed;
     } catch (err) {
-      console.warn('Gemini API call error/fallback:', err.message);
+      console.warn('Gemini API notice, using fallback parser:', err.message);
     }
   }
 
-  // Fallback Rule-Based Parser when Gemini API key is not configured or fails
   return fallbackExtractIntent(userMessage, currentDateStr, userProfile);
 };
 
 /**
- * Deterministic rule-based fallback parser for natural language parsing
+ * Deterministic rule-based fallback parser
  */
 function fallbackExtractIntent(userMessage, currentDateStr, userProfile) {
   const text = userMessage.toLowerCase();
@@ -82,14 +118,13 @@ function fallbackExtractIntent(userMessage, currentDateStr, userProfile) {
     tom.setDate(tom.getDate() + 1);
     targetDate = tom.toISOString().split('T')[0];
   } else {
-    // Check weekday names
     const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
     for (let i = 0; i < days.length; i++) {
       if (text.includes(days[i])) {
         const currentDay = now.getDay();
         let targetDayIndex = i;
         let diff = targetDayIndex - currentDay;
-        if (diff <= 0) diff += 7; // Next occurrence
+        if (diff <= 0) diff += 7;
         const d = new Date(now);
         d.setDate(d.getDate() + diff);
         targetDate = d.toISOString().split('T')[0];
@@ -98,7 +133,7 @@ function fallbackExtractIntent(userMessage, currentDateStr, userProfile) {
     }
   }
 
-  // Time Parsing (e.g. 3 pm, 3:30 pm, 11 am, 15:00)
+  // Time Parsing (e.g. 3 pm, 3:30 pm, 10 am)
   const timeMatch = text.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
   if (timeMatch) {
     let hour = parseInt(timeMatch[1], 10);
@@ -112,7 +147,7 @@ function fallbackExtractIntent(userMessage, currentDateStr, userProfile) {
       startTime = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
     }
   } else if (text.includes('morning')) {
-    startTime = '09:00';
+    startTime = '10:00';
   } else if (text.includes('afternoon')) {
     startTime = '14:00';
   } else if (text.includes('evening')) {
@@ -135,27 +170,33 @@ function fallbackExtractIntent(userMessage, currentDateStr, userProfile) {
     purpose = 'Discussion';
   } else if (text.includes('consultation')) {
     purpose = 'Consultation';
+  } else if (text.includes('review')) {
+    purpose = 'Project Review';
+  } else if (text.includes('audit')) {
+    purpose = 'Design Audit';
   }
 
-  // Missing fields determination
   const missing = [];
   if (!targetDate) missing.push('date');
   if (!startTime) missing.push('startTime');
   if (!purpose) missing.push('purpose');
 
+  const humanDate = targetDate ? formatHumanDate(targetDate) : 'requested date';
+  const time12h = startTime ? formatTime12h(startTime) : '';
+
   let responseMessage = '';
   if (missing.length > 0) {
     if (missing.includes('date') && missing.includes('startTime')) {
-      responseMessage = 'Sure! What date and time would you like to book your appointment?';
+      responseMessage = 'What date and time work for you?';
     } else if (missing.includes('startTime')) {
-      responseMessage = `Got it for ${targetDate || 'your requested date'}. What time would you prefer?`;
+      responseMessage = `What time works for ${humanDate}?`;
     } else if (missing.includes('purpose')) {
-      responseMessage = `Great! I have ${targetDate} at ${startTime}. What is the purpose of this appointment?`;
+      responseMessage = `${time12h} on ${humanDate} is available. What is the appointment for?`;
     } else {
-      responseMessage = `Please provide the missing details: ${missing.join(', ')}.`;
+      responseMessage = `Please specify your preferred ${missing.join(' and ')}.`;
     }
   } else {
-    responseMessage = `I found a request for ${targetDate} at ${startTime} (${duration} mins) for "${purpose}". Let me check availability for you.`;
+    responseMessage = `${time12h} ${humanDate} is available. Ready to book?`;
   }
 
   return {
@@ -163,7 +204,7 @@ function fallbackExtractIntent(userMessage, currentDateStr, userProfile) {
     date: targetDate,
     startTime,
     duration,
-    purpose: purpose || 'General Meeting',
+    purpose: purpose || null,
     name: userProfile.name || 'Valued User',
     email: userProfile.email || '',
     missingFields: missing,
